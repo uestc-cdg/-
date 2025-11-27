@@ -1,27 +1,451 @@
 # 内存池
 
-### 1.1 概述
+本方案包含以下部分：
+1.  **核心代码**：`mpool.h` 和 `mpool.c`。
+2.  **测试代码**：`main.c`。
+3.  **技术文档**：Markdown格式的设计文档。
 
-内存池是一种内存管理技术，通过预先分配一大块内存，然后在应用程序需要时从这块内存中分配小块内存，从而减少频繁调用系统内存分配函数（如malloc/free）带来的开销和内存碎片。
+---
 
-### 1.2 设计目标
+### 第一部分：核心代码实现
 
-- **高效性**：减少系统调用次数，提高内存分配/释放速度
-- **低碎片**：通过固定大小块管理减少内存碎片
-- **线程安全**：支持多线程环境下的安全使用
-- **模块化**：清晰的接口设计，易于集成和维护
-- **可扩展**：支持不同大小的内存块分配
+#### 1. 头文件 (`mpool.h`)
 
-### 1.3 核心组件
+这是对外暴露的接口文件。
 
-- **内存池结构体**：管理整个内存池的状态
-- **空闲链表**：管理可用的内存块
-- **内存块头信息**：每个内存块的元数据
-- **线程同步机制**：互斥锁保证线程安全
+```c
+/* mpool.h */
+#ifndef _MPOOL_H_
+#define _MPOOL_H_
 
-### 1.4 内存池类型
+#include <stddef.h>
 
-- **固定大小内存池**：所有内存块大小相同，适用于特定场景
-- **可变大小内存池**：支持不同大小的内存块分配
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-本实现采用**固定大小内存池**，因为其实现简单、效率高。
+/* 内存池句柄不透明声明 */
+typedef struct mpool_s mpool_t;
+
+/**
+ * @brief 创建内存池
+ * 
+ * @param unit_size 每个内存单元的大小（字节），例如 sizeof(MyStruct)
+ * @param block_size 内部每次向系统申请的大块内存大小（字节），建议为 unit_size 的倍数
+ * @return mpool_t* 成功返回内存池句柄，失败返回 NULL
+ */
+mpool_t* mpool_create(size_t unit_size, size_t block_size);
+
+/**
+ * @brief 销毁内存池
+ *        释放该池申请的所有系统内存，之后该池分配的所有指针均不可用
+ * 
+ * @param pool 内存池句柄
+ */
+void mpool_destroy(mpool_t* pool);
+
+/**
+ * @brief 从内存池中分配一个单元
+ * 
+ * @param pool 内存池句柄
+ * @return void* 指向分配内存的指针，失败返回 NULL
+ */
+void* mpool_alloc(mpool_t* pool);
+
+/**
+ * @brief 将单元归还给内存池
+ * 
+ * @param pool 内存池句柄
+ * @param ptr 待释放的指针
+ */
+void mpool_free(mpool_t* pool, void* ptr);
+
+/**
+ * @brief 获取内存池当前状态信息（调试用）
+ */
+typedef struct {
+    size_t unit_size;       // 单元大小
+    size_t total_blocks;    // 向系统申请的大块数量
+    size_t total_units;     // 总单元数量
+    size_t free_units;      // 当前可用单元数量
+} mpool_stats_t;
+
+void mpool_get_stats(mpool_t* pool, mpool_stats_t* stats);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _MPOOL_H_
+```
+
+#### 2. 实现文件 (`mpool.c`)
+
+这是具体的逻辑实现。采用了**嵌入式空闲链表（Embedded Free List）**技术。
+
+```c
+/* mpool.c */
+#include "mpool.h"
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+/* 内存对齐辅助宏 (通常按 void* 大小对齐) */
+#define ALIGN_SIZE sizeof(void*)
+#define ALIGN(size) (((size) + (ALIGN_SIZE - 1)) & ~(ALIGN_SIZE - 1))
+
+/* 内存块结构 (向系统申请的大块内存) */
+typedef struct mpool_block_s {
+    struct mpool_block_s* next; // 指向下一个大块，用于销毁时遍历
+    char data[];                // 柔性数组，实际内存区域
+} mpool_block_t;
+
+/* 内存池管理结构 */
+struct mpool_s {
+    size_t unit_size;           // 经过对齐后的单元大小
+    size_t block_data_size;     // 每个大块中用于存储数据的区域大小
+    mpool_block_t* block_head;  // 大块链表头 (用于释放)
+    void* free_list_head;       // 空闲单元链表头
+    
+    /* 统计信息 */
+    size_t total_blocks;
+    size_t total_units;
+    size_t free_count;
+};
+
+mpool_t* mpool_create(size_t unit_size, size_t block_size) {
+    if (unit_size == 0 || block_size == 0) return NULL;
+
+    mpool_t* pool = (mpool_t*)malloc(sizeof(mpool_t));
+    if (!pool) return NULL;
+
+    /* 1. 强制对齐 unit_size */
+    size_t aligned_unit = ALIGN(unit_size);
+    /* 2. 单元大小至少要能存下一个指针 (用于空闲链表) */
+    if (aligned_unit < sizeof(void*)) {
+        aligned_unit = sizeof(void*);
+    }
+
+    pool->unit_size = aligned_unit;
+    
+    /* 计算大块中实际可用的数据大小 (扣除头部开销) */
+    /* block_size 最好大于 sizeof(mpool_block_t) + unit_size */
+    if (block_size < sizeof(mpool_block_t) + aligned_unit) {
+        // 如果传入的block太小，自动调整为至少能放一个unit
+        block_size = sizeof(mpool_block_t) + aligned_unit * 4; 
+    }
+    pool->block_data_size = block_size - sizeof(mpool_block_t);
+
+    pool->block_head = NULL;
+    pool->free_list_head = NULL;
+    pool->total_blocks = 0;
+    pool->total_units = 0;
+    pool->free_count = 0;
+
+    return pool;
+}
+
+void mpool_destroy(mpool_t* pool) {
+    if (!pool) return;
+
+    mpool_block_t* curr = pool->block_head;
+    while (curr) {
+        mpool_block_t* next = curr->next;
+        free(curr);
+        curr = next;
+    }
+    free(pool);
+}
+
+/* 内部函数：申请一个新的大块并切割 */
+static int mpool_grow(mpool_t* pool) {
+    size_t total_size = sizeof(mpool_block_t) + pool->block_data_size;
+    mpool_block_t* block = (mpool_block_t*)malloc(total_size);
+    if (!block) return -1;
+
+    // 1. 链接到大块管理链表
+    block->next = pool->block_head;
+    pool->block_head = block;
+    pool->total_blocks++;
+
+    // 2. 切割内存块并挂入空闲链表
+    // 我们从大块的末尾开始切，这样挂入链表后，第一次取出的就是大块头部的内存
+    // 有助于缓存局部性
+    char* data_start = block->data;
+    size_t num_units = pool->block_data_size / pool->unit_size;
+    
+    for (size_t i = 0; i < num_units; ++i) {
+        char* unit_ptr = data_start + (i * pool->unit_size);
+        
+        // 将当前 pool->free_list_head 的值写入该单元的前 sizeof(void*) 字节
+        // 相当于 node->next = head;
+        *(void**)unit_ptr = pool->free_list_head;
+        
+        // 更新头指针
+        pool->free_list_head = (void*)unit_ptr;
+    }
+
+    pool->total_units += num_units;
+    pool->free_count += num_units;
+    
+    return 0;
+}
+
+void* mpool_alloc(mpool_t* pool) {
+    if (!pool) return NULL;
+
+    // 如果没有空闲单元，申请新的大块
+    if (pool->free_list_head == NULL) {
+        if (mpool_grow(pool) != 0) {
+            return NULL; // 内存耗尽
+        }
+    }
+
+    // 从空闲链表头部取出一个单元
+    void* ptr = pool->free_list_head;
+    
+    // 移动头指针指向下一个空闲单元
+    // 这里的逻辑是：取出 ptr 指向的内容（即下一个单元的地址）
+    pool->free_list_head = *(void**)ptr;
+    
+    pool->free_count--;
+    return ptr;
+}
+
+void mpool_free(mpool_t* pool, void* ptr) {
+    if (!pool || !ptr) return;
+
+    // 将 ptr 插入到 free_list_head 的头部
+    // 1. 将当前的 head 地址写入 ptr 指向的内存
+    *(void**)ptr = pool->free_list_head;
+    
+    // 2. 更新 head 为 ptr
+    pool->free_list_head = ptr;
+    
+    pool->free_count++;
+}
+
+void mpool_get_stats(mpool_t* pool, mpool_stats_t* stats) {
+    if (!pool || !stats) return;
+    stats->unit_size = pool->unit_size;
+    stats->total_blocks = pool->total_blocks;
+    stats->total_units = pool->total_units;
+    stats->free_units = pool->free_count;
+}
+```
+
+#### 3. 使用示例 (`main.c`)
+
+```c
+/* main.c */
+#include <stdio.h>
+#include <time.h>
+#include "mpool.h"
+
+typedef struct {
+    int id;
+    char name[32];
+    double value;
+} my_data_t;
+
+int main() {
+    printf("=== Memory Pool Demo ===\n");
+    printf("Size of my_data_t: %zu bytes\n", sizeof(my_data_t));
+
+    // 1. 创建内存池
+    // 单元大小为 my_data_t，每次扩容申请 4KB 的大块
+    mpool_t* pool = mpool_create(sizeof(my_data_t), 4096);
+    if (!pool) {
+        fprintf(stderr, "Failed to create pool\n");
+        return 1;
+    }
+
+    // 2. 分配测试
+    const int TEST_COUNT = 100;
+    my_data_t* ptrs[TEST_COUNT];
+
+    for (int i = 0; i < TEST_COUNT; i++) {
+        ptrs[i] = (my_data_t*)mpool_alloc(pool);
+        if (ptrs[i]) {
+            ptrs[i]->id = i;
+            sprintf(ptrs[i]->name, "Object-%d", i);
+            ptrs[i]->value = i * 3.14;
+        }
+    }
+
+    // 3. 查看状态
+    mpool_stats_t stats;
+    mpool_get_stats(pool, &stats);
+    printf("\n[Stats after alloc]\n");
+    printf("  Unit Size: %zu\n", stats.unit_size);
+    printf("  Total Blocks: %zu\n", stats.total_blocks);
+    printf("  Total Units: %zu\n", stats.total_units);
+    printf("  Free Units: %zu\n", stats.free_units);
+
+    // 4. 使用数据
+    printf("\nData verification: ptrs[50]->name = %s\n", ptrs[50]->name);
+
+    // 5. 释放部分数据
+    printf("\nFreeing first 50 objects...\n");
+    for (int i = 0; i < 50; i++) {
+        mpool_free(pool, ptrs[i]);
+    }
+
+    mpool_get_stats(pool, &stats);
+    printf("[Stats after partial free]\n");
+    printf("  Free Units: %zu\n", stats.free_units); // 应该增加了50
+
+    // 6. 销毁内存池
+    mpool_destroy(pool);
+    printf("\nPool destroyed.\n");
+
+    return 0;
+}
+```
+
+---
+
+### 第二部分：内存池设计文档
+
+以下内容可保存为 `README.md`。
+
+# C语言固定大小内存池 (Fixed-Size Memory Pool)
+
+这是一个轻量级、高性能的C语言内存池实现模块。该模块旨在管理**固定大小**的内存块分配，适用于频繁创建和销毁相同类型对象的场景（如网络包缓冲、游戏对象、链表节点等）。
+
+## 1. 基本概念
+
+在频繁进行 `malloc` 和 `free` 操作时，系统面临两个主要问题：
+1.  **内存碎片 (Fragmentation)**：频繁申请不同大小的内存会导致堆内存支离破碎。
+2.  **性能开销 (Performance)**：系统调用和堆管理算法（如寻找最佳适配块）需要时间。
+
+**内存池**通过预先向系统申请一大块内存（Block），并将其切分为固定大小的小单元（Unit）自行管理。
+-   **Alloc**：从空闲链表中弹出一个单元（O(1)）。
+-   **Free**：将单元插回空闲链表头部（O(1)）。
+
+## 2. 设计原理与拓扑
+
+### 2.1 核心结构
+
+本实现采用 **Block + FreeList** 的混合结构。
+
+*   **Pool (句柄)**：维护整个池的状态。
+*   **Block (大块)**：通过 `malloc` 向操作系统申请的连续内存页（例如 4KB）。池中可能存在多个 Block，通过单向链表串联，以便销毁时统一释放。
+*   **Unit (单元)**：Block 被切分成的最小分配单位。
+*   **Free List (空闲链表)**：这是本设计的精髓。我们不使用额外的结构体来存储空闲节点，而是**利用未使用的内存本身**。
+
+### 2.2 拓扑图解
+
+```text
+                  +-------------+
+                  |  mpool_t    |
+                  |-------------|
+       +----------| free_list   |  (指向第一个可用单元)
+       |          | block_head  |--+
+       |          +-------------+  |
+       |                           |
+       v                           v
+    [ Unit 1 ]                 [ Block A ]
+    (Free)                     +---------+     +---------+
+    | next |------------------>| next    |---->| next    |----> NULL
+    +------+                   |---------|     |---------|
+                               | Unit 1  |     | Unit 5  |
+                               | Unit 2  |     | Unit 6  |
+                               | Unit 3  |     | Unit 7  |
+                               | Unit 4  |     | Unit 8  |
+                               +---------+     +---------+
+```
+
+### 2.3 嵌入式指针 (Embedded Pointer)
+
+当一个 Unit 处于空闲状态时，它内部的数据是无效的。我们利用其前 `sizeof(void*)` 个字节存储指向下一个空闲 Unit 的指针。
+
+*   **Alloc 过程**：
+    1. 检查 `free_list` 是否为空。
+    2. 若不为空，取下 `head`，并将 `head` 更新为 `head->next` (读取内存中的指针值)。
+    3. 若为空，申请新的 Block，切分并链接到 `free_list`，然后执行步骤2。
+
+*   **Free 过程**：
+    1. 传入指针 `ptr`。
+    2. 将 `ptr` 视为链表节点。
+    3. `ptr->next = free_list`。
+    4. `free_list = ptr`。
+
+## 3. 接口设计详解
+
+### 3.1 创建 (`mpool_create`)
+
+```c
+mpool_t* mpool_create(size_t unit_size, size_t block_size);
+```
+- **unit_size**: 你的结构体大小。内部会自动对齐（通常对齐到 8 字节），且最小值为指针大小（64位系统为8字节），以容纳嵌入式指针。
+- **block_size**: 每次扩容的大小。建议设置为 4KB (4096) 或其倍数，以减少系统调用次数并利用 CPU 缓存。
+
+### 3.2 分配 (`mpool_alloc`)
+
+```c
+void* mpool_alloc(mpool_t* pool);
+```
+- 返回一段未初始化的内存。类似于 `malloc`，但速度极快。
+- **注意**: 返回的内存不是 `calloc` 过的（不全为0），需要自行初始化。
+
+### 3.3 释放 (`mpool_free`)
+
+```c
+void mpool_free(mpool_t* pool, void* ptr);
+```
+- 将内存归还给池。
+- **注意**: 并没有真的 `free` 给操作系统，只是标记为可用。只有调用 `mpool_destroy` 才会归还给 OS。
+
+### 3.4 销毁 (`mpool_destroy`)
+
+```c
+void mpool_destroy(mpool_t* pool);
+```
+- 遍历 Block 链表，释放所有向系统申请的大块内存。
+- 销毁后，所有从此池分配的指针均变为悬空指针，不可再用。
+
+## 4. 使用示例
+
+```c
+#include "mpool.h"
+
+typedef struct { int x, y; } Point;
+
+void test() {
+    // 创建池：每个单元存一个Point，每次向系统申请 1KB
+    mpool_t* pool = mpool_create(sizeof(Point), 1024);
+    
+    // 分配
+    Point* p1 = (Point*)mpool_alloc(pool);
+    p1->x = 10; p1->y = 20;
+    
+    Point* p2 = (Point*)mpool_alloc(pool);
+    
+    // 归还 p1
+    mpool_free(pool, p1);
+    
+    // 再次分配，极大概率会复用刚才 p1 的内存地址
+    Point* p3 = (Point*)mpool_alloc(pool);
+    
+    // 销毁
+    mpool_destroy(pool);
+}
+```
+
+## 5. 注意事项
+
+1.  **非线程安全**：本实现为了追求极致性能，未加锁。如果在多线程环境使用，请在外部加互斥锁，或为每个线程创建一个独立的 mpool (Thread Local Pool)。
+2.  **固定大小**：`mpool_alloc` 不接受 size 参数，它只返回创建时设定的大小的内存。
+3.  **内存泄露检测**：由于实际上是一次性向 OS 申请，Valgrind 等工具可能无法检测池内细粒度的泄露，只能检测池本身是否销毁。
+
+---
+
+### 如何编译
+
+将所有文件放在同一目录下：
+
+```bash
+gcc -o demo main.c mpool.c -I.
+./demo
+```
